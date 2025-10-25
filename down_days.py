@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Rolling ATH drawdown detector (CSV-out support)
-# - 초기 ATH: API 또는 로컬 계산
-# - 이후 High로 롤링 ATH 갱신
-# - 기본 종가(Close) 기준, --use-low 로 저가(Low)
-# - 항상 원시(raw) 가격 사용
+# Rolling ATH drawdown detector (CSV-out + hard override start)
+# - 초기 ATH: API 또는 로컬 계산 (raw 가격)
+# - override 지정 시: override 날짜부터 과거를 '절단'하고, 해당 값으로 새로 시작
+# - 기본 종가(Close) 기준, --use-low 로 Low 기준
 # - 기간 d/m/y/ytd/max 자유 형식
-# - optional --csv-out <file>
+# - --csv-out <file> 저장
 
 import argparse
 import sys
 import json
 import re
 import urllib.request
-from typing import Tuple
+from typing import Tuple, Optional
 import pandas as pd
 
 try:
@@ -29,16 +28,18 @@ def parse_args():
     p = argparse.ArgumentParser(description="Rolling ATH drawdown days (API-seeded init ATH optional).")
     p.add_argument("--tickers", "-t", required=True, help="Space-separated tickers, e.g. 'QQQ NVDA'")
     p.add_argument("--period", "-p", default="1y", help="Examples: 10d, 3m, 2y, ytd, max (default: 1y)")
-    p.add_argument("--threshold", "-th", type=float, default=15.0,
-                   help="Drawdown threshold in percent (default: 15)")
-    p.add_argument("--use-low", action="store_true",
-                   help="Use Low instead of Close for drawdown calculation")
+    p.add_argument("--threshold", "-th", type=float, default=15.0, help="Drawdown threshold in percent (default: 15)")
+    p.add_argument("--use-low", action="store_true", help="Use Low instead of Close for drawdown calculation")
     p.add_argument("--init-ath-mode", choices=["api", "local"], default="local",
                    help="Seed initial ATH from 'api' or 'local' (default: local)")
     p.add_argument("--ath-api-url", default=None,
                    help="API URL template with {ticker} and {date} (YYYY-MM-DD; date = first_day-1)")
-    p.add_argument("--csv-out", default=None,
-                   help="Optional: path to output CSV file (e.g. results.csv)")
+    p.add_argument("--csv-out", default=None, help="Optional: path to output CSV file (e.g. results.csv)")
+
+    # NEW: hard override (cut history before date, restart ATH from value)
+    p.add_argument("--override-ath-date", default=None, help="YYYY-MM-DD (from this date onward, restart with value)")
+    p.add_argument("--override-ath-value", type=float, default=None, help="Override ATH value to start from")
+
     return p.parse_args()
 
 # -------------------- #
@@ -141,8 +142,10 @@ def compute_rolling_drawdowns(df: pd.DataFrame,
                               init_ath_date: pd.Timestamp,
                               threshold: float,
                               use_low: bool) -> pd.DataFrame:
+    """표준 롤링(초기 시드 → High 누적최대)."""
     if df.empty:
         return pd.DataFrame(columns=["Date","Low","Close","Drawdown%","Rolling_ATH","ATH_Anchor_Date"])
+
     dates  = df.index.tolist()
     highs  = df["High"].astype(float).tolist()
     lows   = df["Low"].astype(float).tolist()
@@ -152,21 +155,14 @@ def compute_rolling_drawdowns(df: pd.DataFrame,
     anchor_dates = []
 
     first_ath = max(float(init_ath_val), float(highs[0]))
-    if float(highs[0]) >= float(init_ath_val):
-        current_anchor = dates[0]
-    else:
-        current_anchor = init_ath_date
-
-    rolling_ath.append(first_ath)
-    anchor_dates.append(current_anchor)
+    current_anchor = dates[0] if float(highs[0]) >= float(init_ath_val) else init_ath_date
+    rolling_ath.append(first_ath); anchor_dates.append(current_anchor)
 
     for i in range(1, len(dates)):
         if highs[i] > rolling_ath[i-1]:
-            rolling_ath.append(float(highs[i]))
-            current_anchor = dates[i]
+            rolling_ath.append(float(highs[i])); anchor_dates.append(dates[i])
         else:
-            rolling_ath.append(rolling_ath[i-1])
-        anchor_dates.append(current_anchor)
+            rolling_ath.append(rolling_ath[i-1]); anchor_dates.append(anchor_dates[i-1])
 
     basis_series = pd.Series(lows if use_low else closes, index=dates, dtype="float64")
     ath_series   = pd.Series(rolling_ath, index=dates, dtype="float64")
@@ -179,7 +175,64 @@ def compute_rolling_drawdowns(df: pd.DataFrame,
         "Close":[round(float(x), 4) for x in closes],
         "Drawdown%": [round(float(x), 2) for x in dd_pct],
         "Rolling_ATH": [round(float(x), 4) for x in rolling_ath],
-        "ATH_Anchor_Date": [pd.Timestamp(d).strftime("%Y-%m-%d") if pd.notna(d) else "" for d in anchor_dates],
+        "ATH_Anchor_Date": [pd.Timestamp(d).strftime("%Y-%m-%d") for d in anchor_dates],
+    })
+    out = out.loc[out["Drawdown%"] >= threshold].reset_index(drop=True)
+    return out
+
+def compute_rolling_drawdowns_with_override(df: pd.DataFrame,
+                                            override_start_date: pd.Timestamp,
+                                            override_value: float,
+                                            threshold: float,
+                                            use_low: bool) -> pd.DataFrame:
+    """
+    하드 오버라이드 버전:
+    - df를 override_start_date 이상의 구간만 남기고 모두 절단
+    - 첫 날의 초기 ATH = override_value, 앵커 = override_start_date
+    - 이후 High 누적최대
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["Date","Low","Close","Drawdown%","Rolling_ATH","ATH_Anchor_Date"])
+
+    # 스냅: override 날짜 이상 첫 거래일 찾기
+    snap_idx = df.index.searchsorted(pd.Timestamp(override_start_date))
+    if snap_idx >= len(df.index):
+        return pd.DataFrame(columns=["Date","Low","Close","Drawdown%","Rolling_ATH","ATH_Anchor_Date"])  # 범위 밖
+
+    df2 = df.iloc[snap_idx:].copy()
+    df2.index.name = "Date"
+
+    dates  = df2.index.tolist()
+    highs  = df2["High"].astype(float).tolist()
+    lows   = df2["Low"].astype(float).tolist()
+    closes = df2["Close"].astype(float).tolist()
+
+    rolling_ath = []
+    anchor_dates = []
+
+    # 첫 날: override 값으로 고정 시작
+    first_ath = float(override_value)
+    rolling_ath.append(first_ath)
+    anchor_dates.append(dates[0])
+
+    for i in range(1, len(dates)):
+        if highs[i] > rolling_ath[i-1]:
+            rolling_ath.append(float(highs[i])); anchor_dates.append(dates[i])
+        else:
+            rolling_ath.append(rolling_ath[i-1]); anchor_dates.append(anchor_dates[i-1])
+
+    basis_series = pd.Series(lows if use_low else closes, index=dates, dtype="float64")
+    ath_series   = pd.Series(rolling_ath, index=dates, dtype="float64")
+    dd_pct = (ath_series - basis_series) / ath_series.replace(0, pd.NA) * 100.0
+    dd_pct = dd_pct.astype(float).fillna(0.0)
+
+    out = pd.DataFrame({
+        "Date": dates,
+        "Low":  [round(float(x), 4) for x in lows],
+        "Close":[round(float(x), 4) for x in closes],
+        "Drawdown%": [round(float(x), 2) for x in dd_pct],
+        "Rolling_ATH": [round(float(x), 4) for x in rolling_ath],
+        "ATH_Anchor_Date": [pd.Timestamp(d).strftime("%Y-%m-%d") for d in anchor_dates],
     })
     out = out.loc[out["Drawdown%"] >= threshold].reset_index(drop=True)
     return out
@@ -215,8 +268,16 @@ def main():
         print(str(e), file=sys.stderr)
         sys.exit(2)
 
+    # override args 검사
+    if (args.override_ath_date is None) ^ (args.override_ath_value is None):
+        print("Error: --override-ath-date and --override-ath-value must be provided together.", file=sys.stderr)
+        sys.exit(2)
+    override_date = pd.to_datetime(args.override_ath_date).tz_localize(None) if args.override_ath_date else None
+    override_value = float(args.override_ath_value) if args.override_ath_value is not None else None
+
     tickers = [t.strip().upper() for t in args.tickers.split() if t.strip()]
     threshold = float(args.threshold)
+
     all_rows = []
     blocks = []
 
@@ -226,25 +287,39 @@ def main():
             if ohlc.empty:
                 blocks.append(f"# {t}\n(no data)")
                 continue
-            first_day = ohlc.index[0]
 
-            if args.init_ath_mode == "api":
-                init_ath_val, init_ath_date = seed_initial_ath_via_api(t, first_day, args.ath_api_url)
+            if override_date is not None:
+                # 하드 오버라이드 모드: 과거 절단 + 지정값으로 새 시작
+                rows = compute_rolling_drawdowns_with_override(
+                    df=ohlc,
+                    override_start_date=override_date,
+                    override_value=override_value,
+                    threshold=threshold,
+                    use_low=args.use_low
+                )
+                init_msg = f"OverrideATH={override_value:.4f} on {override_date.date()} (history cut)"
             else:
-                init_ath_val, init_ath_date = seed_initial_ath_locally(t, first_day)
+                # 기본: 초기 ATH 시드 후 표준 롤링
+                first_day = ohlc.index[0]
+                if args.init_ath_mode == "api":
+                    init_ath_val, init_ath_date = seed_initial_ath_via_api(t, first_day, args.ath_api_url)
+                else:
+                    init_ath_val, init_ath_date = seed_initial_ath_locally(t, first_day)
 
-            rows = compute_rolling_drawdowns(
-                df=ohlc,
-                init_ath_val=init_ath_val,
-                init_ath_date=init_ath_date,
-                threshold=threshold,
-                use_low=args.use_low
-            )
+                rows = compute_rolling_drawdowns(
+                    df=ohlc,
+                    init_ath_val=init_ath_val,
+                    init_ath_date=init_ath_date,
+                    threshold=threshold,
+                    use_low=args.use_low
+                )
+                init_msg = f"InitATH={init_ath_val:.4f} on {pd.Timestamp(init_ath_date).date()}"
+
             rows["Ticker"] = t
             all_rows.append(rows)
 
             basis = "Low" if args.use_low else "Close"
-            header = f"# {t} | Basis={basis} | InitATH={init_ath_val:.4f} on {pd.Timestamp(init_ath_date).date()} | Price=raw"
+            header = f"# {t} | Basis={basis} | {init_msg} | Price=raw"
             blocks.append(header + "\n" + to_text_table(rows))
         except Exception as e:
             blocks.append(f"# {t}\n(error: {e})")
