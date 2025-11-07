@@ -3,7 +3,6 @@ name: QQQ Drawdown Daily Alert
 on:
   schedule:
     # 월~금, 미국 동부시간 기준 오후 5:05 (DST/표준시 둘 다)
-    - cron: "5 21 * * 1-5"
     - cron: "5 22 * * 1-5"
   workflow_dispatch:        # 수동 실행 버튼
 
