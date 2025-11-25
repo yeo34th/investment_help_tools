@@ -12,7 +12,7 @@ import yfinance as yf
 TICKER = "QQQ"
 SENDER = "jerichoconsultingllc@gmail.com"
 APP_PASSWORD = "wfyx mncu jltt snfl"
-RECIPIENT = "changmo.yeo1@gmail.com"
+RECIPIENTS = ["changmo.yeo1@gmail.com", "jjungh33@hotmail.com"]
 
 def fetch_metrics():
     df = yf.Ticker(TICKER).history(period="max", auto_adjust=False)
@@ -194,10 +194,18 @@ def fetch_macro_indicators():
     }
 
 
-def send_email(subject, body):
+def send_email(subject, body, recipients=None):
+    if recipients is None:
+        recipients = RECIPIENTS
+
+    if isinstance(recipients, str):
+        recipients_list = [recipients]
+    else:
+        recipients_list = list(recipients)
+
     msg = EmailMessage()
     msg["From"] = SENDER
-    msg["To"] = RECIPIENT
+    msg["To"] = ", ".join(recipients_list)
     msg["Subject"] = subject
     msg.set_content(body)
 
