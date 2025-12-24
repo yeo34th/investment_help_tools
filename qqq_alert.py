@@ -12,7 +12,7 @@ import yfinance as yf
 TICKER = "QQQ"
 SENDER = "jerichoconsultingllc@gmail.com"
 APP_PASSWORD = "wfyx mncu jltt snfl"
-RECIPIENTS = ["changmo.yeo1@gmail.com", "jjungh33@hotmail.com"]
+RECIPIENTS = ["changmo.yeo1@gmail.com", "jjungh33@hotmail.com", "tsungchot@gmail.com"]
 
 def fetch_metrics():
     df = yf.Ticker(TICKER).history(period="max", auto_adjust=False)
@@ -255,4 +255,5 @@ if __name__ == "__main__":
     )
 
     send_email(subject, body)
+
     print(f"Sent: {subject}")
